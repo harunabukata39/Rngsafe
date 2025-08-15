@@ -504,3 +504,393 @@
     (err u0)
   )
 )
+
+;; Weighted Random Selection System Constants
+(define-constant ERR_INVALID_WEIGHTS (err u110))
+(define-constant ERR_EMPTY_WEIGHTS_LIST (err u111))
+(define-constant ERR_WEIGHTED_REQUEST_NOT_FOUND (err u112))
+(define-constant ERR_MAX_OUTCOMES_EXCEEDED (err u113))
+(define-constant ERR_WEIGHT_TOO_LARGE (err u114))
+
+;; Weighted request tracking
+(define-data-var weighted-request-counter uint u0)
+(define-data-var max-weighted-outcomes uint u20)
+(define-data-var max-weight-value uint u10000)
+
+;; Weighted outcome structure
+(define-map weighted-outcomes
+  {request-id: uint, outcome-index: uint}
+  {
+    value: uint,
+    weight: uint,
+    description: (string-ascii 50)
+  }
+)
+
+;; Weighted random requests
+(define-map weighted-requests
+  uint
+  {
+    requester: principal,
+    total-weight: uint,
+    outcome-count: uint,
+    stacks-block-height: uint,
+    fulfilled: bool,
+    selected-outcome: (optional uint),
+    selected-value: (optional uint),
+    payment: uint,
+    request-type: (string-ascii 20)
+  }
+)
+
+;; User weighted request tracking
+(define-map user-weighted-requests
+  principal
+  (list 30 uint)
+)
+
+;; Outcome probability cache for efficiency
+(define-map outcome-probabilities
+  uint
+  (list 20 {outcome-index: uint, cumulative-weight: uint})
+)
+
+;; Create weighted random request with custom outcomes
+(define-public (request-weighted-random 
+    (outcomes (list 20 {value: uint, weight: uint, description: (string-ascii 50)}))
+    (request-type (string-ascii 20)))
+  (let
+    (
+      (request-id (+ (var-get weighted-request-counter) u1))
+      (fee (var-get oracle-fee))
+      (user-balance (stx-get-balance tx-sender))
+      (outcome-count (len outcomes))
+    )
+    ;; Validate inputs
+    (asserts! (>= user-balance fee) ERR_INSUFFICIENT_PAYMENT)
+    (asserts! (> outcome-count u0) ERR_EMPTY_WEIGHTS_LIST)
+    (asserts! (<= outcome-count (var-get max-weighted-outcomes)) ERR_MAX_OUTCOMES_EXCEEDED)
+    
+    ;; Process and validate outcomes
+    (let
+      (
+        (total-weight (fold calculate-total-weight outcomes u0))
+        (validation-result (fold validate-outcome-weights outcomes true))
+      )
+      (asserts! validation-result ERR_INVALID_WEIGHTS)
+      (asserts! (> total-weight u0) ERR_INVALID_WEIGHTS)
+      
+      ;; Transfer payment
+      (try! (stx-transfer? fee tx-sender (as-contract tx-sender)))
+      (var-set contract-balance (+ (var-get contract-balance) fee))
+      
+      ;; Store weighted request
+      (map-set weighted-requests request-id
+        {
+          requester: tx-sender,
+          total-weight: total-weight,
+          outcome-count: outcome-count,
+          stacks-block-height: stacks-block-height,
+          fulfilled: false,
+          selected-outcome: none,
+          selected-value: none,
+          payment: fee,
+          request-type: request-type
+        }
+      )
+      
+      ;; Store individual outcomes and build probability cache
+      (let
+        (
+          (store-result (fold store-weighted-outcome 
+            (map add-outcome-index outcomes) 
+            {request-id: request-id, index: u0, cumulative: u0, success: true}))
+        )
+        (asserts! (get success store-result) ERR_INVALID_REQUEST)
+        
+        ;; Update user tracking
+        (let
+          (
+            (current-requests (default-to (list) (map-get? user-weighted-requests tx-sender)))
+            (updated-requests (unwrap! (as-max-len? (append current-requests request-id) u30) ERR_INVALID_REQUEST))
+          )
+          (map-set user-weighted-requests tx-sender updated-requests)
+        )
+        
+        (var-set weighted-request-counter request-id)
+        (ok request-id)
+      )
+    )
+  )
+)
+
+;; Subscription-based weighted random request
+(define-public (request-weighted-random-subscription 
+    (outcomes (list 20 {value: uint, weight: uint, description: (string-ascii 50)}))
+    (request-type (string-ascii 20)))
+  (let
+    (
+      (subscription-data (unwrap! (map-get? subscriptions tx-sender) ERR_SUBSCRIPTION_NOT_FOUND))
+      (current-block stacks-block-height)
+      (is-active (<= current-block (get end-block subscription-data)))
+      (quota-remaining (- (get total-quota subscription-data) (get requests-used subscription-data)))
+      (request-id (+ (var-get weighted-request-counter) u1))
+      (outcome-count (len outcomes))
+    )
+    ;; Validate subscription and inputs
+    (asserts! is-active ERR_SUBSCRIPTION_EXPIRED)
+    (asserts! (> quota-remaining u0) ERR_QUOTA_EXCEEDED)
+    (asserts! (> outcome-count u0) ERR_EMPTY_WEIGHTS_LIST)
+    (asserts! (<= outcome-count (var-get max-weighted-outcomes)) ERR_MAX_OUTCOMES_EXCEEDED)
+    
+    ;; Process outcomes
+    (let
+      (
+        (total-weight (fold calculate-total-weight outcomes u0))
+        (validation-result (fold validate-outcome-weights outcomes true))
+      )
+      (asserts! validation-result ERR_INVALID_WEIGHTS)
+      (asserts! (> total-weight u0) ERR_INVALID_WEIGHTS)
+      
+      ;; Store weighted request (no payment for subscription)
+      (map-set weighted-requests request-id
+        {
+          requester: tx-sender,
+          total-weight: total-weight,
+          outcome-count: outcome-count,
+          stacks-block-height: stacks-block-height,
+          fulfilled: false,
+          selected-outcome: none,
+          selected-value: none,
+          payment: u0,
+          request-type: request-type
+        }
+      )
+      
+      ;; Store outcomes and update subscription usage
+      (let
+        (
+          (store-result (fold store-weighted-outcome 
+            (map add-outcome-index outcomes) 
+            {request-id: request-id, index: u0, cumulative: u0, success: true}))
+        )
+        (asserts! (get success store-result) ERR_INVALID_REQUEST)
+        
+        ;; Update subscription usage
+        (map-set subscriptions tx-sender
+          (merge subscription-data
+            {
+              requests-used: (+ (get requests-used subscription-data) u1)
+            }
+          )
+        )
+        
+        ;; Update user tracking
+        (let
+          (
+            (current-requests (default-to (list) (map-get? user-weighted-requests tx-sender)))
+            (updated-requests (unwrap! (as-max-len? (append current-requests request-id) u30) ERR_INVALID_REQUEST))
+          )
+          (map-set user-weighted-requests tx-sender updated-requests)
+        )
+        
+        (var-set weighted-request-counter request-id)
+        (ok request-id)
+      )
+    )
+  )
+)
+
+;; Fulfill weighted random request using probability distribution
+(define-public (fulfill-weighted-request (request-id uint) (seed uint))
+  (let
+    (
+      (request-data (unwrap! (map-get? weighted-requests request-id) ERR_WEIGHTED_REQUEST_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (not (get fulfilled request-data)) ERR_REQUEST_ALREADY_FULFILLED)
+    
+    (let
+      (
+        (total-weight (get total-weight request-data))
+        (block-hash (unwrap-panic (get-stacks-block-info? id-header-hash (get stacks-block-height request-data))))
+        (combined-seed (+ seed (len block-hash)))
+        ;; Generate random value within total weight range
+        (random-weight (mod combined-seed total-weight))
+        ;; Find selected outcome using cumulative probability
+        (selected-result (find-weighted-outcome request-id random-weight))
+      )
+      (let
+        (
+          (selected-outcome (get outcome-index selected-result))
+          (outcome-data (unwrap! (map-get? weighted-outcomes {request-id: request-id, outcome-index: selected-outcome}) ERR_INVALID_REQUEST))
+          (selected-value (get value outcome-data))
+        )
+        ;; Update request with results
+        (map-set weighted-requests request-id
+          (merge request-data
+            {
+              fulfilled: true,
+              selected-outcome: (some selected-outcome),
+              selected-value: (some selected-value)
+            }
+          )
+        )
+        (ok {outcome-index: selected-outcome, value: selected-value})
+      )
+    )
+  )
+)
+
+;; Helper functions for weighted random processing
+
+;; Add index to outcome for processing
+(define-private (add-outcome-index (outcome {value: uint, weight: uint, description: (string-ascii 50)}))
+  (merge outcome {index: u0})
+)
+
+;; Calculate total weight of all outcomes
+(define-private (calculate-total-weight 
+    (outcome {value: uint, weight: uint, description: (string-ascii 50)}) 
+    (acc uint))
+  (+ acc (get weight outcome))
+)
+
+;; Validate individual outcome weights
+(define-private (validate-outcome-weights 
+    (outcome {value: uint, weight: uint, description: (string-ascii 50)}) 
+    (acc bool))
+  (and acc 
+       (> (get weight outcome) u0) 
+       (<= (get weight outcome) (var-get max-weight-value)))
+)
+
+;; Store weighted outcome and build cumulative probability
+(define-private (store-weighted-outcome 
+    (outcome {value: uint, weight: uint, description: (string-ascii 50), index: uint})
+    (acc {request-id: uint, index: uint, cumulative: uint, success: bool}))
+  (if (get success acc)
+    (let
+      (
+        (current-index (get index acc))
+        (new-cumulative (+ (get cumulative acc) (get weight outcome)))
+      )
+      ;; Store the outcome
+      (map-set weighted-outcomes 
+        {request-id: (get request-id acc), outcome-index: current-index}
+        {
+          value: (get value outcome),
+          weight: (get weight outcome),
+          description: (get description outcome)
+        }
+      )
+      
+      ;; Update cumulative probability cache
+      (let
+        (
+          (current-probs (default-to (list) (map-get? outcome-probabilities (get request-id acc))))
+          (new-prob-entry {outcome-index: current-index, cumulative-weight: new-cumulative})
+          (updated-probs (unwrap! (as-max-len? (append current-probs new-prob-entry) u20) 
+                         {request-id: (get request-id acc), index: current-index, cumulative: new-cumulative, success: false}))
+        )
+        (map-set outcome-probabilities (get request-id acc) updated-probs)
+        {
+          request-id: (get request-id acc),
+          index: (+ current-index u1),
+          cumulative: new-cumulative,
+          success: true
+        }
+      )
+    )
+    acc
+  )
+)
+
+;; Find winning outcome based on random weight
+(define-private (find-weighted-outcome (request-id uint) (target-weight uint))
+  (let
+    (
+      (probabilities (default-to (list) (map-get? outcome-probabilities request-id)))
+    )
+    (fold select-outcome-by-weight probabilities {outcome-index: u0, target: target-weight, found: false})
+  )
+)
+
+;; Select outcome based on cumulative weight comparison
+(define-private (select-outcome-by-weight 
+    (prob-entry {outcome-index: uint, cumulative-weight: uint})
+    (acc {outcome-index: uint, target: uint, found: bool}))
+  (if (or (get found acc) (< (get target acc) (get cumulative-weight prob-entry)))
+    (if (get found acc)
+      acc
+      {outcome-index: (get outcome-index prob-entry), target: (get target acc), found: true})
+    acc
+  )
+)
+
+;; Administrative functions for weighted system
+(define-public (set-max-weighted-outcomes (new-max uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (<= new-max u20) ERR_INVALID_REQUEST)
+    (var-set max-weighted-outcomes new-max)
+    (ok true)
+  )
+)
+
+(define-public (set-max-weight-value (new-max uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (var-set max-weight-value new-max)
+    (ok true)
+  )
+)
+
+;; Read-only functions for weighted system
+(define-read-only (get-weighted-request (request-id uint))
+  (map-get? weighted-requests request-id)
+)
+
+(define-read-only (get-weighted-outcome (request-id uint) (outcome-index uint))
+  (map-get? weighted-outcomes {request-id: request-id, outcome-index: outcome-index})
+)
+
+(define-read-only (get-user-weighted-requests (user principal))
+  (map-get? user-weighted-requests user)
+)
+
+(define-read-only (get-weighted-request-counter)
+  (var-get weighted-request-counter)
+)
+
+(define-read-only (is-weighted-request-fulfilled (request-id uint))
+  (match (map-get? weighted-requests request-id)
+    request-data (get fulfilled request-data)
+    false
+  )
+)
+
+(define-read-only (get-weighted-result (request-id uint))
+  (match (map-get? weighted-requests request-id)
+    request-data 
+      (if (get fulfilled request-data)
+        {
+          outcome-index: (get selected-outcome request-data),
+          value: (get selected-value request-data)
+        }
+        {
+          outcome-index: none,
+          value: none
+        }
+      )
+    {
+      outcome-index: none,
+      value: none
+    }
+  )
+)
+
+(define-read-only (get-outcome-probabilities (request-id uint))
+  (map-get? outcome-probabilities request-id)
+)
+
